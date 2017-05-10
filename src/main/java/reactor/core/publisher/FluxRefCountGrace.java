@@ -27,6 +27,7 @@ import org.reactivestreams.Subscription;
 import reactor.core.Disposable;
 import reactor.core.Fuseable;
 import reactor.core.Scannable;
+import reactor.core.disposable.SequentialDisposable;
 import reactor.core.scheduler.Scheduler;
 
 /**
@@ -56,35 +57,6 @@ final class FluxRefCountGrace<T> extends Flux<T> implements Scannable, Fuseable 
 		this.scheduler = scheduler;
 	}
 
-	private static <U> boolean replaceAtomically(AtomicReferenceFieldUpdater<U, Disposable> fieldUpdater, U instance, Disposable newValue) {
-		for (;;) {
-			Disposable current = fieldUpdater.get(instance);
-			if (current == DISPOSED) {
-				if (newValue != null) {
-					newValue.dispose();
-				}
-				return false;
-			}
-			if (fieldUpdater.compareAndSet(instance, current, newValue)) {
-				return true;
-			}
-		}
-	}
-
-	private static <U> boolean disposeAtomically(AtomicReferenceFieldUpdater<U, Disposable> fieldUpdater, U instance) {
-		Disposable current = fieldUpdater.get(instance);
-		Disposable d = DISPOSED;
-		if (current != d) {
-			current = fieldUpdater.getAndSet(instance, d);
-			if (current != d) {
-				if (current != null) {
-					current.dispose();
-				}
-				return true;
-			}
-		}
-		return false;
-	}
 
 	@Override
 	public int getPrefetch() {
@@ -137,6 +109,7 @@ final class FluxRefCountGrace<T> extends Flux<T> implements Scannable, Fuseable 
 	}
 
 	void cancel(RefConnection rc) {
+		SequentialDisposable sd;
 		synchronized (this) {
 			if (rc.terminated) {
 				return;
@@ -150,9 +123,11 @@ final class FluxRefCountGrace<T> extends Flux<T> implements Scannable, Fuseable 
 				timeout(rc);
 				return;
 			}
-			timeoutTask = scheduler.schedule(rc, gracePeriod.toMillis(), TimeUnit.MILLISECONDS);
-			rc.timer = timeoutTask;
+			sd = new SequentialDisposable();
+			rc.timer = sd;
 		}
+
+		sd.replace(scheduler.schedule(rc, gracePeriod.toMillis(), TimeUnit.MILLISECONDS));
 	}
 
 	void terminated(RefConnection rc) {
@@ -167,7 +142,7 @@ final class FluxRefCountGrace<T> extends Flux<T> implements Scannable, Fuseable 
 	void timeout(RefConnection rc) {
 		synchronized (this) {
 			if (rc.subscriberCount == 0 && rc == connection) {
-				disposeAtomically(RefConnection.SOURCE_DISCONNECTOR, rc);
+				SequentialDisposable.dispose(RefConnection.SOURCE_DISCONNECTOR, rc);
 				if (source instanceof Disposable) {
 					((Disposable) source).dispose();
 				}
@@ -200,7 +175,7 @@ final class FluxRefCountGrace<T> extends Flux<T> implements Scannable, Fuseable 
 
 		@Override
 		public void accept(Disposable t) {
-			replaceAtomically(SOURCE_DISCONNECTOR, this, t);
+			SequentialDisposable.replace(SOURCE_DISCONNECTOR, this, t);
 		}
 	}
 
